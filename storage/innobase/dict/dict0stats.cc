@@ -33,6 +33,7 @@ Created Jan 06, 2010 Vasil Dimov
 #include "log.h"
 #include "btr0btr.h"
 #include "btr0sea.h"
+#include "buf0rea.h"
 #include "que0que.h"
 #include "scope.h"
 #include "debug_sync.h"
@@ -1939,6 +1940,79 @@ void PageStats::scan_below(trx_t *trx, const btr_cur_t *cur) noexcept
 	mtr_commit(&mtr);
 }
 
+/** Prefetch, as one asynchronous batch, the child pages of
+the records that IndexLevelStats::sample_leaf_pages() is about
+to dive below. Must be called with the mini-transaction holding
+only the index SX-latch
+@param index     index being analyzed
+@param level     B-tree level the samples are picked from
+@param dive_idx  record indices to dive below
+@param mtr       mini-transaction */
+static void
+dict_stats_prefetch_sample_children(dict_index_t *index, ulint level,
+                                    const std::vector<uint64_t> &dive_idx,
+                                    mtr_t *mtr) noexcept
+{
+	fil_space_t*	space = index->table->space;
+
+	if (!space || dive_idx.empty()) {
+		return;
+	}
+
+	const auto	sp = mtr->get_savepoint();
+	btr_pcur_t	pcur;
+
+	if (btr_pcur_open_level(&pcur, level, mtr, index) != DB_SUCCESS
+	    || !btr_pcur_move_to_next_on_page(&pcur)) {
+		mtr->rollback_to_savepoint(sp);
+		return;
+	}
+
+	/* At most one read-ahead batch is prefetched;
+	the remaining dives read their pages synchronously */
+	uint32_t	pages[buf_pool_t::READ_AHEAD_PAGES];
+	size_t		n_pages = 0;
+
+	mem_heap_t*	heap = NULL;
+	rec_offs	offsets_[REC_OFFS_NORMAL_SIZE];
+	rec_offs_init(offsets_);
+
+	uint64_t	rec_idx = 0;
+
+	for (uint64_t di : dive_idx) {
+		if (n_pages == UT_ARR_SIZE(pages)) {
+			break;
+		}
+		while (rec_idx < di && btr_pcur_is_on_user_rec(&pcur)) {
+			btr_pcur_move_to_next_user_rec(&pcur, mtr);
+			rec_idx++;
+		}
+
+		/* The B-tree changed under us, or we reached the end of the
+		level: stop collecting, prefetch what we have. */
+		if (rec_idx != di || !btr_pcur_is_on_user_rec(&pcur)) {
+			break;
+		}
+
+		const rec_t*	rec = btr_pcur_get_rec(&pcur);
+		rec_offs*	offsets = rec_get_offsets(
+			rec, index, offsets_, 0, ULINT_UNDEFINED, &heap);
+
+		pages[n_pages++] = btr_node_ptr_get_child_page_no(rec, offsets);
+	}
+
+	if (heap != NULL) {
+		mem_heap_free(heap);
+	}
+
+	mtr->rollback_to_savepoint(sp);
+
+	if (n_pages) {
+		buf_read_ahead_pages(
+			space, st_::span<const uint32_t>(pages, n_pages));
+	}
+}
+
 void
 IndexLevelStats::sample_leaf_pages(
 	trx_t*			trx,
@@ -1958,6 +2032,34 @@ IndexLevelStats::sample_leaf_pages(
 
 	/* Position pcur on the leftmost record on the leftmost page
 	on the desired level. */
+
+	/* Pick the record index to dive below in each of
+	n_analyze_leaf_pages segments (a random record from each),
+	and prefetch those pages up front so the dives below find warm
+	pages. Both the prefetch and the analysis pass use the same
+	dive_idx, so they dive below the same (randomly chosen) records. */
+	const uint64_t	last_idx_on_level = bounds[n_prefix - 1][
+	  unsigned(n_diff_data->n_diff_on_level - 1)];
+
+	std::vector<uint64_t>	dive_idx;
+	dive_idx.reserve(size_t(n_diff_data->n_analyze_leaf_pages));
+
+	for (i = 0; i < n_diff_data->n_analyze_leaf_pages; i++) {
+		const uint64_t	n_diff = n_diff_data->n_diff_on_level;
+		const uint64_t	n_pick = n_diff_data->n_analyze_leaf_pages;
+		const uint64_t	left = n_diff * i / n_pick;
+		const uint64_t	right = n_diff * (i + 1) / n_pick - 1;
+
+		ut_a(left <= right);
+		ut_a(right <= last_idx_on_level);
+
+		dive_idx.push_back(bounds[n_prefix - 1][unsigned(
+			left + ut_rnd_interval(
+				static_cast<ulint>(right - left)))]);
+	}
+
+	dict_stats_prefetch_sample_children(index, n_diff_data->level,
+					    dive_idx, mtr);
 
 	if (btr_pcur_open_level(&pcur, n_diff_data->level, mtr, index)
 	    != DB_SUCCESS
@@ -1980,54 +2082,12 @@ IndexLevelStats::sample_leaf_pages(
 		return;
 	}
 
-	const uint64_t	last_idx_on_level = bounds[n_prefix - 1][
-	  unsigned(n_diff_data->n_diff_on_level - 1)];
-
 	rec_idx = 0;
 
 	for (i = 0; i < n_diff_data->n_analyze_leaf_pages; i++) {
-		/* there are n_diff_on_level elements
-		in 'boundaries' and we divide those elements
-		into n_analyze_leaf_pages segments, for example:
-
-		let n_diff_on_level=100, n_analyze_leaf_pages=4, then:
-		segment i=0:  [0, 24]
-		segment i=1: [25, 49]
-		segment i=2: [50, 74]
-		segment i=3: [75, 99] or
-
-		let n_diff_on_level=1, n_analyze_leaf_pages=1, then:
-		segment i=0: [0, 0] or
-
-		let n_diff_on_level=2, n_analyze_leaf_pages=2, then:
-		segment i=0: [0, 0]
-		segment i=1: [1, 1] or
-
-		let n_diff_on_level=13, n_analyze_leaf_pages=7, then:
-		segment i=0:  [0,  0]
-		segment i=1:  [1,  2]
-		segment i=2:  [3,  4]
-		segment i=3:  [5,  6]
-		segment i=4:  [7,  8]
-		segment i=5:  [9, 10]
-		segment i=6: [11, 12]
-
-		then we select a random record from each segment and dive
-		below it */
-		const uint64_t	n_diff = n_diff_data->n_diff_on_level;
-		const uint64_t	n_pick = n_diff_data->n_analyze_leaf_pages;
-
-		const uint64_t	left = n_diff * i / n_pick;
-		const uint64_t	right = n_diff * (i + 1) / n_pick - 1;
-
-		ut_a(left <= right);
-		ut_a(right <= last_idx_on_level);
-
-		const ulint	rnd = ut_rnd_interval(
-			static_cast<ulint>(right - left));
-
-		const uint64_t	dive_below_idx
-			= bounds[n_prefix - 1][unsigned(left + rnd)];
+		/* Dive below the record picked for this segment
+		above (see the dive_idx computation). */
+		const uint64_t	dive_below_idx = dive_idx[i];
 
 #if 0
 		DEBUG_PRINTF("    %s(): dive below record with index="
